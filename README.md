@@ -1,7 +1,7 @@
 # Reef
 
-[![CI](https://github.com/QTSurfer/reef/actions/workflows/ci.yml/badge.svg)](https://github.com/QTSurfer/reef/actions/workflows/ci.yml)
-[![JitPack](https://jitpack.io/v/QTSurfer/reef.svg)](https://jitpack.io/#QTSurfer/reef)
+[![CI](https://github.com/QTSurfer/reef-java/actions/workflows/ci.yml/badge.svg)](https://github.com/QTSurfer/reef-java/actions/workflows/ci.yml)
+[![JitPack](https://jitpack.io/v/QTSurfer/reef-java.svg)](https://jitpack.io/#QTSurfer/reef-java)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 Columnar time series file format with per-column codec selection.
@@ -139,7 +139,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.qtsurfer:reef:0.1.0'
+    implementation 'com.github.qtsurfer:reef-java:0.1.0'
 }
 ```
 

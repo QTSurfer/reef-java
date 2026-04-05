@@ -11,12 +11,12 @@
     <description>Reef: columnar time series file format. Combines per-column codec selection
         (ALP, Gorilla, delta-varint) with separated series and events sections for efficient
         storage of financial tick data and strategy signals.</description>
-    <url>https://github.com/QTSurfer/reef</url>
+    <url>https://github.com/QTSurfer/reef-java</url>
 
     <scm>
-        <connection>scm:git:git@github.com:QTSurfer/reef.git</connection>
-        <url>scm:git:git@github.com:QTSurfer/reef.git</url>
-        <developerConnection>scm:git:git@github.com:QTSurfer/reef.git</developerConnection>
+        <connection>scm:git:git@github.com:QTSurfer/reef-java.git</connection>
+        <url>scm:git:git@github.com:QTSurfer/reef-java.git</url>
+        <developerConnection>scm:git:git@github.com:QTSurfer/reef-java.git</developerConnection>
         <tag>HEAD</tag>
     </scm>
 
