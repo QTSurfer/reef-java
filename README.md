@@ -126,8 +126,8 @@ OHLCV ticker data (1000 rows, 2 decimal places):
 
 <dependency>
     <groupId>com.github.qtsurfer</groupId>
-    <artifactId>reef</artifactId>
-    <version>0.1.0</version>
+    <artifactId>reef-java</artifactId>
+    <version>0.5.0</version>
 </dependency>
 ```
 
