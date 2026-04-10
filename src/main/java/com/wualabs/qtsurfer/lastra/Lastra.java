@@ -75,4 +75,6 @@ public final class Lastra {
     public static final int FLAG_HAS_FOOTER = 1 << 1;
     /** Per-column CRC32 checksums stored in footer. */
     public static final int FLAG_HAS_CHECKSUMS = 1 << 2;
+    /** Multiple row groups with per-group statistics for range queries. */
+    public static final int FLAG_HAS_ROW_GROUPS = 1 << 3;
 }

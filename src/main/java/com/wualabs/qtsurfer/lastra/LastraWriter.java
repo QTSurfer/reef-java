@@ -51,8 +51,27 @@ public class LastraWriter implements Closeable {
     private final List<double[]> eventDoubleBuffers = new ArrayList<>();
     private final List<byte[][]> eventBinaryBuffers = new ArrayList<>();
 
+    // Row groups: each entry is a pre-compressed row group with its stats
+    private final List<RowGroupData> rowGroups = new ArrayList<>();
+
     private int seriesRowCount;
     private int eventsRowCount;
+    private int rowGroupSize = DEFAULT_ROW_GROUP_SIZE;
+
+    /** Default row group size in rows. */
+    public static final int DEFAULT_ROW_GROUP_SIZE = 4096;
+
+    private static final class RowGroupData {
+        final int rowCount;
+        final long tsMin, tsMax;
+        final List<byte[]> compressedColumns;
+        final List<Integer> crcs;
+        RowGroupData(int rowCount, long tsMin, long tsMax,
+                     List<byte[]> compressedColumns, List<Integer> crcs) {
+            this.rowCount = rowCount; this.tsMin = tsMin; this.tsMax = tsMax;
+            this.compressedColumns = compressedColumns; this.crcs = crcs;
+        }
+    }
 
     public LastraWriter(OutputStream out) {
         this.out = out;
@@ -79,11 +98,73 @@ public class LastraWriter implements Closeable {
     }
 
     /**
-     * Set series data from arrays. Each array corresponds to a series column in order.
-     * Use {@code long[]} for LONG columns, {@code double[]} for DOUBLE, {@code byte[][]} for BINARY.
+     * Sets the row group size. Data passed to {@link #writeSeries} is automatically partitioned
+     * into row groups of this size. Default: {@value #DEFAULT_ROW_GROUP_SIZE}.
+     */
+    public LastraWriter setRowGroupSize(int size) {
+        this.rowGroupSize = size;
+        return this;
+    }
+
+    /**
+     * Set series data from arrays, auto-partitioned into row groups.
+     *
+     * <p>The first LONG column is assumed to be the timestamp for row group statistics.
+     * Each array corresponds to a series column in order. Use {@code long[]} for LONG,
+     * {@code double[]} for DOUBLE, {@code byte[][]} for BINARY.
      */
     public LastraWriter writeSeries(int rowCount, Object... columnData) {
         this.seriesRowCount = rowCount;
+
+        // Partition into row groups
+        for (int start = 0; start < rowCount; start += rowGroupSize) {
+            int end = Math.min(start + rowGroupSize, rowCount);
+            int rgRows = end - start;
+
+            // Slice arrays for this row group
+            Object[] slice = new Object[columnData.length];
+            long tsMin = Long.MAX_VALUE, tsMax = Long.MIN_VALUE;
+
+            for (int i = 0; i < seriesColumns.size(); i++) {
+                ColumnDescriptor col = seriesColumns.get(i);
+                switch (col.dataType()) {
+                    case LONG: {
+                        long[] src = (long[]) columnData[i];
+                        long[] dst = new long[rgRows];
+                        System.arraycopy(src, start, dst, 0, rgRows);
+                        slice[i] = dst;
+                        // First LONG column = timestamp for stats
+                        if (tsMin == Long.MAX_VALUE) {
+                            tsMin = dst[0];
+                            tsMax = dst[rgRows - 1];
+                        }
+                        break;
+                    }
+                    case DOUBLE: {
+                        double[] src = (double[]) columnData[i];
+                        double[] dst = new double[rgRows];
+                        System.arraycopy(src, start, dst, 0, rgRows);
+                        slice[i] = dst;
+                        break;
+                    }
+                    case BINARY: {
+                        byte[][] src = (byte[][]) columnData[i];
+                        byte[][] dst = new byte[rgRows][];
+                        System.arraycopy(src, start, dst, 0, rgRows);
+                        slice[i] = dst;
+                        break;
+                    }
+                }
+            }
+
+            // Compress and buffer this row group
+            List<byte[]> compressed = compressRowGroup(slice, rgRows);
+            List<Integer> crcs = new ArrayList<>();
+            for (byte[] col : compressed) crcs.add(crc32(col));
+            rowGroups.add(new RowGroupData(rgRows, tsMin, tsMax, compressed, crcs));
+        }
+
+        // Also store raw buffers for single-RG backward compat path (not used when rowGroups > 0)
         for (int i = 0; i < seriesColumns.size(); i++) {
             ColumnDescriptor col = seriesColumns.get(i);
             switch (col.dataType()) {
@@ -105,6 +186,25 @@ public class LastraWriter implements Closeable {
             }
         }
         return this;
+    }
+
+    private List<byte[]> compressRowGroup(Object[] columnData, int rowCount) {
+        List<byte[]> result = new ArrayList<>();
+        for (int i = 0; i < seriesColumns.size(); i++) {
+            ColumnDescriptor col = seriesColumns.get(i);
+            switch (col.dataType()) {
+                case LONG:
+                    result.add(compressLongColumn((long[]) columnData[i], rowCount, col.codec()));
+                    break;
+                case DOUBLE:
+                    result.add(compressDoubleColumn((double[]) columnData[i], rowCount, col.codec()));
+                    break;
+                case BINARY:
+                    result.add(compressBinaryColumn((byte[][]) columnData[i], rowCount, col.codec()));
+                    break;
+            }
+        }
+        return result;
     }
 
     /**
@@ -138,8 +238,10 @@ public class LastraWriter implements Closeable {
     @Override
     public void close() throws IOException {
         boolean hasEvents = !eventColumns.isEmpty() && eventsRowCount > 0;
+        boolean hasRowGroups = rowGroups.size() > 1;
         int flags = Lastra.FLAG_HAS_FOOTER | Lastra.FLAG_HAS_CHECKSUMS;
         if (hasEvents) flags |= Lastra.FLAG_HAS_EVENTS;
+        if (hasRowGroups) flags |= Lastra.FLAG_HAS_ROW_GROUPS;
 
         ByteArrayOutputStream body = new ByteArrayOutputStream();
 
@@ -160,17 +262,26 @@ public class LastraWriter implements Closeable {
             writeColumnDescriptors(body, eventColumns);
         }
 
-        // === SERIES DATA ===
-        List<byte[]> seriesCompressed = compressColumns(seriesColumns,
-                seriesLongBuffers, seriesDoubleBuffers, seriesBinaryBuffers, seriesRowCount);
-        List<Integer> seriesOffsets = new ArrayList<>();
-        List<Integer> seriesCrcs = new ArrayList<>();
         int dataStart = body.size();
-        for (byte[] colData : seriesCompressed) {
-            seriesOffsets.add(body.size() - dataStart);
-            writeIntLE(body, colData.length);
-            body.write(colData);
-            seriesCrcs.add(crc32(colData));
+
+        // === SERIES DATA (row groups) ===
+        List<Integer> rgOffsets = new ArrayList<>();
+        if (hasRowGroups) {
+            // Multiple row groups: write each RG's columns sequentially
+            for (RowGroupData rg : rowGroups) {
+                rgOffsets.add(body.size() - dataStart);
+                for (byte[] colData : rg.compressedColumns) {
+                    writeIntLE(body, colData.length);
+                    body.write(colData);
+                }
+            }
+        } else if (!rowGroups.isEmpty()) {
+            // Single row group: write as flat columns (backward compat)
+            RowGroupData rg = rowGroups.get(0);
+            for (byte[] colData : rg.compressedColumns) {
+                writeIntLE(body, colData.length);
+                body.write(colData);
+            }
         }
 
         // === EVENTS DATA ===
@@ -188,10 +299,38 @@ public class LastraWriter implements Closeable {
         }
 
         // === FOOTER ===
-        for (int offset : seriesOffsets) writeIntLE(body, offset);
-        for (int offset : eventOffsets) writeIntLE(body, offset);
-        for (int crc : seriesCrcs) writeIntLE(body, crc);
-        for (int crc : eventCrcs) writeIntLE(body, crc);
+        if (hasRowGroups) {
+            // Row group metadata
+            writeIntLE(body, rowGroups.size());
+            for (int i = 0; i < rowGroups.size(); i++) {
+                RowGroupData rg = rowGroups.get(i);
+                writeIntLE(body, rgOffsets.get(i));   // byte offset
+                writeIntLE(body, rg.rowCount);      // rows in this RG
+                writeLongLE(body, rg.tsMin);         // min timestamp
+                writeLongLE(body, rg.tsMax);         // max timestamp
+            }
+            // Per-RG per-column CRCs
+            for (RowGroupData rg : rowGroups) {
+                for (int crc : rg.crcs) writeIntLE(body, crc);
+            }
+        } else if (!rowGroups.isEmpty()) {
+            // Single RG: write flat column offsets + CRCs (backward compat)
+            // Format: [series offsets][event offsets][series CRCs][event CRCs]
+            RowGroupData rg = rowGroups.get(0);
+            int pos = 0;
+            for (byte[] colData : rg.compressedColumns) {
+                writeIntLE(body, pos);
+                pos += 4 + colData.length;
+            }
+            for (int offset : eventOffsets) writeIntLE(body, offset);
+            for (int crc : rg.crcs) writeIntLE(body, crc);
+            for (int crc : eventCrcs) writeIntLE(body, crc);
+        } else {
+            // No data at all — just event offsets+CRCs if any
+            for (int offset : eventOffsets) writeIntLE(body, offset);
+            for (int crc : eventCrcs) writeIntLE(body, crc);
+        }
+
         writeIntLE(body, Lastra.FOOTER_MAGIC);
 
         out.write(body.toByteArray());
@@ -269,6 +408,11 @@ public class LastraWriter implements Closeable {
         CRC32 crc = new CRC32();
         crc.update(data);
         return (int) crc.getValue();
+    }
+
+    private static void writeLongLE(ByteArrayOutputStream out, long value) {
+        writeIntLE(out, (int) value);
+        writeIntLE(out, (int) (value >>> 32));
     }
 
     private static void writeIntLE(ByteArrayOutputStream out, int value) {

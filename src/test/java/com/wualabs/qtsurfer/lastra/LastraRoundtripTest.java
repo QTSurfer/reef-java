@@ -309,6 +309,85 @@ class LastraRoundtripTest {
                 seriesRows, eventCount, baos.size());
     }
 
+    /**
+     * Row groups: 10,000 rows auto-partitioned into RGs of 3600 (simulating hourly chunks).
+     * Verifies: RG count, per-RG stats (tsMin/tsMax), selective RG read, full read via
+     * readSeriesDouble (concatenates all RGs).
+     */
+    @Test
+    void testRowGroupsAutoPartition() throws Exception {
+        int totalRows = 10_000;
+        int rgSize = 3600; // ~1 hour of 1s ticks
+        long[] ts = new long[totalRows];
+        double[] close = new double[totalRows];
+        long baseTs = 1711152000000L; // millis
+        Random rng = new Random(42);
+        for (int i = 0; i < totalRows; i++) {
+            ts[i] = baseTs + i * 1000L;
+            close[i] = Math.round((65000.0 + Math.sin(i * 0.001) * 500 + rng.nextDouble() * 10) * 100.0) / 100.0;
+        }
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (LastraWriter w = new LastraWriter(baos)) {
+            w.setRowGroupSize(rgSize);
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("close", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.writeSeries(totalRows, ts, close);
+        }
+
+        byte[] bytes = baos.toByteArray();
+        LastraReader r = LastraReader.from(bytes);
+
+        // 10000 / 3600 = 2 full + 1 partial = 3 row groups
+        assertThat(r.rowGroupCount()).isEqualTo(3);
+        assertThat(r.seriesRowCount()).isEqualTo(totalRows);
+
+        // RG stats
+        RowGroupStats rg0 = r.rowGroupStats(0);
+        assertThat(rg0.rowCount()).isEqualTo(3600);
+        assertThat(rg0.tsMin()).isEqualTo(ts[0]);
+        assertThat(rg0.tsMax()).isEqualTo(ts[3599]);
+
+        RowGroupStats rg1 = r.rowGroupStats(1);
+        assertThat(rg1.rowCount()).isEqualTo(3600);
+        assertThat(rg1.tsMin()).isEqualTo(ts[3600]);
+        assertThat(rg1.tsMax()).isEqualTo(ts[7199]);
+
+        RowGroupStats rg2 = r.rowGroupStats(2);
+        assertThat(rg2.rowCount()).isEqualTo(2800); // remainder
+        assertThat(rg2.tsMin()).isEqualTo(ts[7200]);
+        assertThat(rg2.tsMax()).isEqualTo(ts[9999]);
+
+        // Selective RG read: only RG 1 (hour 2)
+        double[] rg1Close = r.readRowGroupDouble(1, "close");
+        assertThat(rg1Close).hasSize(3600);
+        for (int i = 0; i < 3600; i++) {
+            assertThat(Double.doubleToRawLongBits(rg1Close[i]))
+                    .isEqualTo(Double.doubleToRawLongBits(close[3600 + i]));
+        }
+
+        // Full read (concatenates all RGs)
+        long[] allTs = r.readSeriesLong("ts");
+        assertThat(allTs).containsExactly(ts);
+        double[] allClose = r.readSeriesDouble("close");
+        assertBitExact(allClose, close);
+
+        // Temporal filter: find RGs overlapping [ts[4000], ts[5000]]
+        long queryFrom = ts[4000];
+        long queryTo = ts[5000];
+        int matchedRgs = 0;
+        for (int i = 0; i < r.rowGroupCount(); i++) {
+            RowGroupStats s = r.rowGroupStats(i);
+            if (s.tsMax() >= queryFrom && s.tsMin() <= queryTo) {
+                matchedRgs++;
+            }
+        }
+        assertThat(matchedRgs).isEqualTo(1); // only RG 1 (3600-7199) overlaps
+
+        System.out.printf("Row groups: %d rows → %d RGs (size %d), %d bytes, query matched %d RG%n",
+                totalRows, r.rowGroupCount(), rgSize, bytes.length, matchedRgs);
+    }
+
     private static void assertBitExact(double[] actual, double[] expected) {
         assertThat(actual).hasSize(expected.length);
         for (int i = 0; i < expected.length; i++) {
