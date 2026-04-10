@@ -204,6 +204,111 @@ class LastraRoundtripTest {
         assertBitExact(r.readSeriesDouble("v"), values);
     }
 
+    /**
+     * Events with heterogeneous column lengths.
+     *
+     * <p>Simulates a strategy that emits buy signals (3), sell signals (2), and stop-loss (1).
+     * All event columns share eventsRowCount = max(3, 2, 1) = 3. Shorter columns are padded
+     * with zero/empty values. A "type" column identifies the event category.
+     *
+     * <p>Layout in memory:
+     * <pre>
+     *   row | ts                  | type      | price    | reason
+     *   0   | 1711152050000000000 | BUY       | 65042.17 | (empty)
+     *   1   | 1711152120000000000 | BUY       | 65100.33 | (empty)
+     *   2   | 1711152200000000000 | BUY       | 64980.50 | (empty)
+     *   --- padded from here for SELL (2 events) and STOP_LOSS (1 event) ---
+     * </pre>
+     *
+     * <p>In practice, heterogeneous events are written as separate .lastra files
+     * or merged into a single events section with the union of all columns,
+     * using the highest count and padding shorter ones with defaults.
+     */
+    @Test
+    void testHeterogeneousEventsPaddedToMaxCount() throws Exception {
+        // Series: minimal
+        int seriesRows = 100;
+        long[] ts = new long[seriesRows];
+        double[] close = new double[seriesRows];
+        long baseTs = 1711152000000000000L;
+        for (int i = 0; i < seriesRows; i++) {
+            ts[i] = baseTs + i * 1_000_000_000L;
+            close[i] = 65000.0 + i;
+        }
+
+        // 3 buy events, 2 sell events, 1 stop-loss = 6 total events
+        // All share the same eventsRowCount = 6
+        int eventCount = 6;
+        long[] eventTs = {
+                baseTs + 10_000_000_000L,   // BUY
+                baseTs + 50_000_000_000L,   // BUY
+                baseTs + 70_000_000_000L,   // BUY
+                baseTs + 30_000_000_000L,   // SELL
+                baseTs + 80_000_000_000L,   // SELL
+                baseTs + 60_000_000_000L,   // STOP_LOSS
+        };
+        byte[][] eventTypes = {
+                "BUY".getBytes(StandardCharsets.UTF_8),
+                "BUY".getBytes(StandardCharsets.UTF_8),
+                "BUY".getBytes(StandardCharsets.UTF_8),
+                "SELL".getBytes(StandardCharsets.UTF_8),
+                "SELL".getBytes(StandardCharsets.UTF_8),
+                "STOP_LOSS".getBytes(StandardCharsets.UTF_8),
+        };
+        // price: all events have a price
+        double[] eventPrices = {65042.17, 65100.33, 64980.50, 65200.00, 65150.75, 64900.00};
+        // reason: only STOP_LOSS has a reason, others are empty
+        byte[][] eventReasons = {
+                new byte[0],  // BUY - no reason
+                new byte[0],  // BUY
+                new byte[0],  // BUY
+                new byte[0],  // SELL
+                new byte[0],  // SELL
+                "{\"trigger\":\"trailing_stop\",\"pct\":2.5}".getBytes(StandardCharsets.UTF_8),
+        };
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (LastraWriter w = new LastraWriter(baos)) {
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("close", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.addEventColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addEventColumn("type", Lastra.DataType.BINARY, Lastra.Codec.VARLEN);
+            w.addEventColumn("price", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.addEventColumn("reason", Lastra.DataType.BINARY, Lastra.Codec.VARLEN_ZSTD);
+            w.writeSeries(seriesRows, ts, close);
+            w.writeEvents(eventCount, eventTs, eventTypes, eventPrices, eventReasons);
+        }
+
+        LastraReader r = LastraReader.from(baos.toByteArray());
+        assertThat(r.seriesRowCount()).isEqualTo(seriesRows);
+        assertThat(r.eventsRowCount()).isEqualTo(eventCount);
+        assertThat(r.eventColumns()).hasSize(4);
+
+        // All 6 events readable
+        long[] gotTs = r.readEventLong("ts");
+        assertThat(gotTs).hasSize(eventCount);
+        assertThat(gotTs).containsExactly(eventTs);
+
+        // Types: all 6 present
+        byte[][] gotTypes = r.readEventBinary("type");
+        assertThat(new String(gotTypes[0], StandardCharsets.UTF_8)).isEqualTo("BUY");
+        assertThat(new String(gotTypes[3], StandardCharsets.UTF_8)).isEqualTo("SELL");
+        assertThat(new String(gotTypes[5], StandardCharsets.UTF_8)).isEqualTo("STOP_LOSS");
+
+        // Prices: all 6 present
+        double[] gotPrices = r.readEventDouble("price");
+        assertBitExact(gotPrices, eventPrices);
+
+        // Reason: only index 5 has content, rest are empty
+        byte[][] gotReasons = r.readEventBinary("reason");
+        assertThat(gotReasons[0]).isEmpty();
+        assertThat(gotReasons[4]).isEmpty();
+        assertThat(new String(gotReasons[5], StandardCharsets.UTF_8)).contains("trailing_stop");
+
+        System.out.printf("Heterogeneous events: %d series + %d events (3 BUY + 2 SELL + 1 STOP_LOSS), %d bytes%n",
+                seriesRows, eventCount, baos.size());
+    }
+
     private static void assertBitExact(double[] actual, double[] expected) {
         assertThat(actual).hasSize(expected.length);
         for (int i = 0; i < expected.length; i++) {
