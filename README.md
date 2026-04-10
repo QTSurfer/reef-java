@@ -35,6 +35,13 @@ EVENTS DATA:        per column: [4 bytes length] [compressed data]
 FOOTER:             column offsets + [column CRC32s] + "LAS!" magic
 ```
 
+### Events section
+
+All event columns share a single `eventsRowCount`. When columns have
+different logical lengths, use the highest count and pad shorter columns
+with zero/empty values. Use a `type` column (VARLEN) to identify event
+categories and filter on read.
+
 ### Header flags
 
 | Flag | Bit | Description |
