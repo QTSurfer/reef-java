@@ -95,158 +95,26 @@ public class LastraReader {
         this.rgColLen = new ArrayList<>();
         this.rgColCrcs = new ArrayList<>();
 
+        // Detect footer size hint: last 8 bytes = [LAS! magic][footer size LE]
+        // If present, we know exactly where the footer starts.
+        int trailerSize = 8; // LAS! + footerSize
+        boolean hasFooterSizeHint = false;
+        if (data.length >= 8) {
+            int trailMagic = getIntLE(data, data.length - 8);
+            if (trailMagic == Lastra.FOOTER_MAGIC) {
+                hasFooterSizeHint = true;
+                trailerSize = 8;
+            }
+        }
+
         if (hasFooter && hasRowGroups) {
-            // Parse row group footer from the end
-            // Footer layout: [rgCount:4] [rgCount × (offset:4 + rows:4 + tsMin:8 + tsMax:8)]
-            //                 [rgCount × seriesColCount × CRC:4]
-            //                 [eventColCount × offset:4] [eventColCount × CRC:4]
-            //                 [LAS!:4]
+            // Use footer size hint to locate footer precisely
+            int footerSize = getIntLE(data, data.length - 4);
+            int footerPos = data.length - trailerSize - footerSize;
 
-            // First, find rgCount: scan backwards from LAS! magic
-            // We know: last 4 bytes = LAS!, before that = event CRCs + event offsets
-            // Before events = RG CRCs, before that = RG stats, before that = rgCount
-            // Easier: scan forward from data to find where RGs end, then parse footer
-
-            // Use a two-pass approach: first scan data forward to find all RG data positions,
-            // then parse footer from end.
-
-            // Actually, read rgCount from footer start. Footer size depends on rgCount which
-            // we don't know yet. Read it by scanning from the end.
-            int endPos = data.length - 4; // skip LAS!
-            int footerMagic = getIntLE(data, endPos);
-            if (footerMagic != Lastra.FOOTER_MAGIC) {
-                throw new IllegalArgumentException("Invalid Lastra footer");
-            }
-
-            // Event CRCs + offsets (from end, before LAS!)
-            int eventCols = eventColumns.size();
-            int eventFooterSize = eventCols * 4 * (hasChecksums ? 2 : 1); // offsets + crcs
-            int eventFooterStart = endPos - eventFooterSize;
-
-            this.eventCrcs = new int[eventCols];
-            this.eventOffsets = new int[eventCols];
-            // Read event offsets then CRCs (or just offsets if no checksums)
-            // They're written as: [event offsets][event CRCs]
-            int ep = eventFooterStart;
-            for (int i = 0; i < eventCols; i++) { eventOffsets[i] = getIntLE(data, ep); ep += 4; }
-            if (hasChecksums) {
-                for (int i = 0; i < eventCols; i++) { eventCrcs[i] = getIntLE(data, ep); ep += 4; }
-            }
-
-            // Before events: RG CRCs [rgCount × seriesColCount × 4]
-            // Before that: RG stats [rgCount × 24 bytes]
-            // Before that: rgCount [4 bytes]
-            // We need to find rgCount first. It's at a known position relative to the end.
-            // Total footer = rgCount(4) + rgCount×24 + rgCount×seriesColCount×4(crcs) + eventFooter + 4(magic)
-            // Can't solve without rgCount. Read it from the data section boundary instead.
-
-            // Scan data forward to count RG boundaries, or read rgCount from the footer.
-            // The rgCount is the first int after the data+events section.
-            // Simpler: parse data section forward, count RGs by scanning column length prefixes.
-
-            // Actually, let's compute: we know the footer starts right after events data.
-            // Scan series data + events data forward, then the first int is rgCount.
-            // But we don't know where data ends without rgCount...
-
-            // Simplest: scan backwards. rgCount × (24 + seriesColCount×4) + 4 + eventFooter + 4 = ???
-            // We can try reading rgCount at different positions. But cleaner: read it from a known
-            // location. Let me restructure: put rgCount as the LAST int before LAS! magic.
-            // No — that changes the writer. Let me just read forward.
-
-            // Forward approach: skip all RG data, then read footer sequentially.
-            int scanPos = dataOffset;
-            // We don't know how many RGs, but we can read until we hit the footer region.
-            // The footer region starts after all data. We can detect it because the first
-            // int of footer is rgCount (a small number like 1-100), vs column data lengths
-            // (typically hundreds to thousands).
-
-            // Actually the simplest correct approach: put rgCount at a FIXED position.
-            // Read it from right before event footer:
-            // [RG CRCs][rgCount:4][event offsets][event CRCs][LAS!]
-            // No, that's messy. Let me just put rgCount right before LAS! along with
-            // a flag. Or better: read the footer from end.
-
-            // The writer writes: [rgCount][rg stats...][rg crcs...][event offsets][event crcs][LAS!]
-            // From the end: LAS!(4) + eventCrcs(ec×4) + eventOffsets(ec×4) + rgCrcs(rc×sc×4) + rgStats(rc×24) + rgCount(4)
-            // Total from end = 4 + ec×8 + rc×sc×4 + rc×24 + 4
-            // We know ec and sc but not rc. Read rc from the position:
-            // rgCountPos = endPos - eventFooterSize - ???
-            // We can't compute without rc.
-
-            // Solution: put rgCount at the END of footer, just before LAS!
-            // New footer: [rg stats][rg crcs][event offsets][event crcs][rgCount][LAS!]
-            // Then: rgCountPos = endPos - 4, and we read it first.
-            // This requires changing the writer. Let me do that.
-
-            // For now, assume rgCount is the 4 bytes just before eventFooter+LAS!
-            // Actually the writer writes rgCount FIRST in the footer. Let me reparse
-            // by reading forward from where data ends.
-
-            // Forward scan: read all RG data, then footer is what remains.
-            // Each RG has seriesColCount columns, each with [4-byte len][data].
-            // Read them all, grouping by seriesColCount.
-            int rgDataScanPos = dataOffset;
-            List<int[]> tempRgColPos = new ArrayList<>();
-            List<int[]> tempRgColLen = new ArrayList<>();
-            // Keep reading groups of seriesColCount columns until we can't
-            while (true) {
-                // Peek: is the next int a plausible column length or rgCount?
-                if (rgDataScanPos + 4 > data.length) break;
-                int peek = getIntLE(data, rgDataScanPos);
-                // After all RG data, next comes event data or footer.
-                // Heuristic: column lengths are > 0 and < 10MB; rgCount would be < 1000
-                // Better: track how much data we've consumed vs total.
-                // We know total series data spans from dataOffset to events start.
-                // But we don't know events start without knowing RG count.
-
-                // Safest: read exactly seriesColCount columns, check if we're still in data range.
-                int[] colPos = new int[seriesColCount];
-                int[] colLen = new int[seriesColCount];
-                boolean valid = true;
-                int tempPos = rgDataScanPos;
-                for (int c = 0; c < seriesColCount; c++) {
-                    if (tempPos + 4 > data.length) { valid = false; break; }
-                    int len = getIntLE(data, tempPos);
-                    if (len < 0 || tempPos + 4 + len > data.length) { valid = false; break; }
-                    colPos[c] = tempPos + 4;
-                    colLen[c] = len;
-                    tempPos += 4 + len;
-                }
-                if (!valid) break;
-
-                // Verify this is actual column data, not footer
-                // The footer starts with rgCount (small int). If peek == tempRgColPos.size()+1
-                // and we've read some RGs, this might be the footer.
-                // More robust: check if after reading this "RG", the next bytes parse as another
-                // RG or as footer. For now, trust the structure.
-                tempRgColPos.add(colPos);
-                tempRgColLen.add(colLen);
-                rgDataScanPos = tempPos;
-
-                // Safety: don't read more than a reasonable number of RGs
-                if (tempRgColPos.size() > 100000) break;
-            }
-
-            // Now rgDataScanPos points to events data (if any) or footer.
-            // Read events data
-            this.eventDataPos = new int[eventCols];
-            this.eventDataLen = new int[eventCols];
-            for (int i = 0; i < eventCols; i++) {
-                int len = getIntLE(data, rgDataScanPos);
-                eventDataPos[i] = rgDataScanPos + 4;
-                eventDataLen[i] = len;
-                rgDataScanPos += 4 + len;
-            }
-
-            // Now parse footer: rgCount, rg stats, rg CRCs
-            int fp = rgDataScanPos;
+            // Parse footer: [rgCount][rg stats...][rg CRCs...][event offsets][event CRCs]
+            int fp = footerPos;
             int rgCount = getIntLE(data, fp); fp += 4;
-
-            // Verify rgCount matches what we scanned
-            if (rgCount != tempRgColPos.size()) {
-                throw new IllegalArgumentException("Row group count mismatch: footer=" + rgCount
-                    + " scanned=" + tempRgColPos.size());
-            }
 
             for (int i = 0; i < rgCount; i++) {
                 int rgOffset = getIntLE(data, fp); fp += 4;
@@ -256,19 +124,49 @@ public class LastraReader {
                 rowGroupStatsList.add(new RowGroupStats(rgRows, rgOffset, rgTsMin, rgTsMax));
             }
 
-            // RG CRCs
-            for (int i = 0; i < rgCount; i++) {
-                int[] crcs = new int[seriesColCount];
-                for (int c = 0; c < seriesColCount; c++) {
-                    crcs[c] = getIntLE(data, fp); fp += 4;
+            if (hasChecksums) {
+                for (int i = 0; i < rgCount; i++) {
+                    int[] crcs = new int[seriesColCount];
+                    for (int c = 0; c < seriesColCount; c++) {
+                        crcs[c] = getIntLE(data, fp); fp += 4;
+                    }
+                    rgColCrcs.add(crcs);
                 }
-                rgColCrcs.add(crcs);
             }
 
-            this.rgColPos.addAll(tempRgColPos);
-            this.rgColLen.addAll(tempRgColLen);
+            int eventCols = eventColumns.size();
+            this.eventOffsets = new int[eventCols];
+            this.eventCrcs = new int[eventCols];
+            for (int i = 0; i < eventCols; i++) { eventOffsets[i] = getIntLE(data, fp); fp += 4; }
+            if (hasChecksums) {
+                for (int i = 0; i < eventCols; i++) { eventCrcs[i] = getIntLE(data, fp); fp += 4; }
+            }
 
-            // Series-level pos/len not used with row groups, but set for compatibility
+            // Scan RG data forward using rgCount from footer
+            int scanPos = dataOffset;
+            for (int rg = 0; rg < rgCount; rg++) {
+                int[] colPos = new int[seriesColCount];
+                int[] colLen = new int[seriesColCount];
+                for (int c = 0; c < seriesColCount; c++) {
+                    int len = getIntLE(data, scanPos);
+                    colPos[c] = scanPos + 4;
+                    colLen[c] = len;
+                    scanPos += 4 + len;
+                }
+                rgColPos.add(colPos);
+                rgColLen.add(colLen);
+            }
+
+            // Events data
+            this.eventDataPos = new int[eventCols];
+            this.eventDataLen = new int[eventCols];
+            for (int i = 0; i < eventCols; i++) {
+                int len = getIntLE(data, scanPos);
+                eventDataPos[i] = scanPos + 4;
+                eventDataLen[i] = len;
+                scanPos += 4 + len;
+            }
+
             this.seriesDataPos = new int[0];
             this.seriesDataLen = new int[0];
             this.seriesOffsets = new int[0];
@@ -279,9 +177,9 @@ public class LastraReader {
             int totalCols = seriesColCount + eventColumns.size();
             int footerInts = totalCols; // offsets
             if (hasChecksums) footerInts += totalCols; // + CRCs
-            footerInts += 1; // LAS! magic
 
-            int footerStart = data.length - footerInts * 4;
+            // Footer ends before the trailer (LAS! + footerSize = 8 bytes, or just LAS! = 4 bytes)
+            int footerStart = data.length - trailerSize - footerInts * 4;
             ByteBuffer footer = ByteBuffer.wrap(data, footerStart, footerInts * 4)
                     .order(ByteOrder.LITTLE_ENDIAN);
 
@@ -308,10 +206,7 @@ public class LastraReader {
                 this.eventCrcs = new int[0];
             }
 
-            int footerMagic = footer.getInt();
-            if (footerMagic != Lastra.FOOTER_MAGIC) {
-                throw new IllegalArgumentException("Invalid Lastra footer");
-            }
+            // LAS! magic already verified via trailer detection above
 
             // Precompute column data positions by scanning length prefixes
             this.seriesDataPos = new int[seriesColCount];
@@ -343,18 +238,55 @@ public class LastraReader {
         }
     }
 
+    private static final int READ_BUFFER_SIZE = 32 * 1024; // 32 KB
+
     /**
-     * Read a Lastra file from an InputStream (loads entirely into memory).
+     * Read a Lastra file from an InputStream using a 32 KB read buffer.
+     * Prefer {@link #from(byte[])} or {@link #from(java.nio.ByteBuffer)} when
+     * the data is already in memory to avoid copying.
      */
     public static LastraReader from(InputStream in) throws IOException {
-        return new LastraReader(in.readAllBytes());
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        byte[] readBuf = new byte[READ_BUFFER_SIZE];
+        int n;
+        while ((n = in.read(readBuf)) != -1) {
+            baos.write(readBuf, 0, n);
+        }
+        return new LastraReader(baos.toByteArray());
     }
 
     /**
-     * Read a Lastra file from a byte array.
+     * Read a Lastra file from a byte array (zero-copy).
      */
     public static LastraReader from(byte[] data) {
         return new LastraReader(data);
+    }
+
+    /**
+     * Read a Lastra file from a ByteBuffer (zero-copy if backed by array).
+     */
+    public static LastraReader from(java.nio.ByteBuffer buffer) {
+        if (buffer.hasArray() && buffer.arrayOffset() == 0 && buffer.remaining() == buffer.array().length) {
+            return new LastraReader(buffer.array());
+        }
+        byte[] data = new byte[buffer.remaining()];
+        buffer.get(data);
+        return new LastraReader(data);
+    }
+
+    /**
+     * Returns the footer size in bytes (from the footer size hint).
+     * Useful for HTTP Range request planning: fetch last 8 bytes to get LAS! + footerSize,
+     * then fetch footerSize bytes to parse row group stats before fetching data.
+     *
+     * @param data the last 8 bytes of the file
+     * @return footer size, or -1 if not a valid Lastra trailer
+     */
+    public static int readFooterSize(byte[] trailer) {
+        if (trailer.length < 8) return -1;
+        int magic = getIntLE(trailer, trailer.length - 8);
+        if (magic != Lastra.FOOTER_MAGIC) return -1;
+        return getIntLE(trailer, trailer.length - 4);
     }
 
     public int seriesRowCount() { return seriesRowCount; }

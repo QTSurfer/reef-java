@@ -20,6 +20,7 @@ public class LastraTestFixtureGenerator {
         generateSeriesOnly(outDir);
         generateWithMetadata(outDir);
         generateWithEvents(outDir);
+        generateWithRowGroups(outDir);
 
         System.out.println("Fixtures written to " + outDir);
     }
@@ -83,6 +84,26 @@ public class LastraTestFixtureGenerator {
             w.addEventColumn("data", Lastra.DataType.BINARY, Lastra.Codec.VARLEN_ZSTD);
             w.writeSeries(rows, ts, close);
             w.writeEvents(eventCount, eventTs, types, data);
+        }
+    }
+
+    private static void generateWithRowGroups(Path dir) throws Exception {
+        int totalRows = 10000;
+        int rgSize = 3600;
+        long[] ts = new long[totalRows];
+        double[] close = new double[totalRows];
+        long baseTs = 1711152000000L; // millis
+        Random rng = new Random(42);
+        for (int i = 0; i < totalRows; i++) {
+            ts[i] = baseTs + i * 1000L;
+            close[i] = Math.round((65000.0 + Math.sin(i * 0.001) * 500 + rng.nextDouble() * 10) * 100.0) / 100.0;
+        }
+
+        try (LastraWriter w = new LastraWriter(new FileOutputStream(dir.resolve("row-groups.lastra").toFile()))) {
+            w.setRowGroupSize(rgSize);
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("close", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.writeSeries(totalRows, ts, close);
         }
     }
 }

@@ -299,6 +299,7 @@ public class LastraWriter implements Closeable {
         }
 
         // === FOOTER ===
+        int footerStart = body.size();
         if (hasRowGroups) {
             // Row group metadata
             writeIntLE(body, rowGroups.size());
@@ -331,7 +332,11 @@ public class LastraWriter implements Closeable {
             for (int crc : eventCrcs) writeIntLE(body, crc);
         }
 
+        int footerSize = body.size() - footerStart;
         writeIntLE(body, Lastra.FOOTER_MAGIC);
+        // Footer size hint: allows HTTP Range clients to fetch footer in 2 requests
+        // (read last 8 bytes → LAS! + footerSize → read footerSize bytes)
+        writeIntLE(body, footerSize);
 
         out.write(body.toByteArray());
         out.flush();
