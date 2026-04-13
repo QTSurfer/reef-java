@@ -45,13 +45,6 @@
         <zstd.version>1.5.6-9</zstd.version>
     </properties>
 
-    <repositories>
-        <repository>
-            <id>jitpack.io</id>
-            <url>https://jitpack.io</url>
-        </repository>
-    </repositories>
-
     <dependencies>
         <!-- ALP codec for double compression -->
         <dependency>
