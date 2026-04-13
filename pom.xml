@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.wualabs.qtsurfer</groupId>
@@ -7,8 +8,8 @@
     <version>0.8.0</version>
     <packaging>jar</packaging>
 
-    <name>Reef</name>
-    <description>Reef: columnar time series file format optimized for numeric data.
+    <name>Lastra</name>
+    <description>Lastra: columnar time series file format optimized for numeric data.
         Combines per-column codec selection (ALP, Gorilla, Pongo, delta-varint) with
         separated series and events sections. Ideal for financial tick data, IoT sensors,
         and infrastructure metrics.</description>
@@ -44,12 +45,19 @@
         <zstd.version>1.5.6-9</zstd.version>
     </properties>
 
+    <repositories>
+        <repository>
+            <id>jitpack.io</id>
+            <url>https://jitpack.io</url>
+        </repository>
+    </repositories>
+
     <dependencies>
         <!-- ALP codec for double compression -->
         <dependency>
             <groupId>com.github.qtsurfer</groupId>
             <artifactId>alp-java</artifactId>
-            <version>0.1.0</version>
+            <version>0.2.1</version>
         </dependency>
         <!-- ZSTD for binary column compression -->
         <dependency>
@@ -105,7 +113,9 @@
                         <executions>
                             <execution>
                                 <id>attach-sources</id>
-                                <goals><goal>jar</goal></goals>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
                             </execution>
                         </executions>
                     </plugin>
@@ -116,7 +126,9 @@
                         <executions>
                             <execution>
                                 <id>attach-javadocs</id>
-                                <goals><goal>jar</goal></goals>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
                             </execution>
                         </executions>
                     </plugin>
