@@ -241,6 +241,37 @@ OHLCV ticker data (1000 rows, 2 decimal places):
 
 [Apache Parquet](https://parquet.apache.org/) has a much larger ecosystem (Spark, DuckDB, Arrow, Pandas) and advanced features: predicate pushdown, bloom filters, column statistics, nested types, and modular encryption.
 
+## Lastra vs Apache ORC
+
+### Codec comparison
+
+| Aspect | [Apache ORC](https://orc.apache.org/) | Lastra |
+|--------|---|---|
+| **Timestamps (int64)** | RLE + delta encoding (~1-2 bytes/value) | DELTA_VARINT (~1 byte/value) |
+| **Doubles (numeric)** | **PLAIN (raw 8 bytes)** + block compression (ZLIB/ZSTD) | **ALP** (~3-4 bits/value), **Pongo** (~18 bits/value), **Gorilla** (XOR) |
+| **Strings / binary** | DICTIONARY + RLE, DIRECT | VARLEN, VARLEN_ZSTD, VARLEN_GZIP |
+| **Block compression** | ZLIB, ZSTD, Snappy, LZ4 | No (compression integrated per codec) |
+| **Per-column codec** | Same codec for all columns | **Different codec per column** |
+| **Row groups** | Stripes (250 MB), row groups (10K rows) | Configurable (default 4096 rows) |
+| **Predicate pushdown** | Min/max per stripe + bloom filters | tsMin/tsMax per row group |
+| **ACID transactions** | Yes (Hive) | No |
+| **Schema** | Protobuf in footer (nested types, unions) | Fixed 22-byte header (flat types) |
+| **Dependencies** | Hadoop, Protobuf, hive-storage-api | alp-java + zstd-jni |
+| **Optimized for** | Data warehousing, ACID, big data | Numeric time series (financial, IoT, infra) |
+
+### Why Lastra compresses doubles better than ORC
+
+[Apache ORC](https://orc.apache.org/) encodes doubles as **raw 8 bytes** (IEEE 754 PLAIN) then applies generic block compression (ZLIB/ZSTD) over the entire stripe. This is the same limitation as Parquet — generic compressors don't understand decimal structure.
+
+Lastra applies **semantic compression** that understands the data:
+- **ALP** knows `65007.28` has 2 decimal places → encodes as integer `6500728` → 3-4 bits/value
+- **Pongo** erases mantissa noise before XOR → ~18 bits/value
+- Result: **~2x better compression** than ORC for numeric time series
+
+### Where ORC wins
+
+[Apache ORC](https://orc.apache.org/) has ACID transaction support (Hive), bloom filters for equality predicates, excellent integer encoding (RLE v2), a mature ecosystem (Hive, Spark, Presto/Trino, Flink, Iceberg), and support for complex nested types via Protobuf schemas.
+
 ## Dependency (JitPack)
 
 ### Maven
