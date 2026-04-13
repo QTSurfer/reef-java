@@ -29,10 +29,16 @@ COLUMN DESCRIPTORS (series, then events):
   codec | dataType | flags | name
   optional: metadata (JSON, gzip-compressed)
 
-SERIES DATA:        per column: [4 bytes length] [compressed data]
+SERIES DATA:
+  Without row groups: per column: [4 bytes length] [compressed data]
+  With row groups:    per RG: per column: [4 bytes length] [compressed data]
+
 EVENTS DATA:        per column: [4 bytes length] [compressed data]
 
-FOOTER:             column offsets + [column CRC32s] + "LAS!" magic
+FOOTER:
+  Without row groups: [column offsets] + [column CRC32s] + "LAS!" magic
+  With row groups:    [rgCount] + [per-RG stats] + [per-RG CRC32s]
+                      + [event offsets] + [event CRC32s] + "LAS!" magic
 ```
 
 ### Events section
@@ -49,10 +55,19 @@ categories and filter on read.
 | `FLAG_HAS_EVENTS` | 0 | File contains an events section |
 | `FLAG_HAS_FOOTER` | 1 | Footer with column offsets is present |
 | `FLAG_HAS_CHECKSUMS` | 2 | Per-column CRC32 checksums in footer |
+| `FLAG_HAS_ROW_GROUPS` | 3 | Multiple row groups with per-group statistics |
+
+### Row groups
+
+When `FLAG_HAS_ROW_GROUPS` is set, series data is partitioned into row groups. Each row group contains all series columns for a subset of rows, with codecs reset per group (enabling independent decoding).
+
+The footer stores per-RG metadata: byte offset, row count, tsMin, tsMax. Readers can skip row groups whose timestamp range doesn't overlap the query window — enabling efficient HTTP range requests against remote files.
+
+Row group size is configurable via `setRowGroupSize()` (default: 4096 rows). Files with fewer rows than the group size are written as a single implicit row group without the flag.
 
 ### Integrity: per-column CRC32
 
-When `FLAG_HAS_CHECKSUMS` is set, the footer contains one CRC32 (IEEE 802.3) per column, computed over the compressed data bytes. The reader verifies each column on access — a corrupted column throws an exception identifying which column failed, while intact columns remain readable.
+When `FLAG_HAS_CHECKSUMS` is set, the footer contains one CRC32 (IEEE 802.3) per column per row group, computed over the compressed data bytes. The reader verifies each column on access — a corrupted column throws an exception identifying which column failed, while intact columns remain readable.
 
 ## Codecs
 
@@ -125,6 +140,18 @@ try (LastraWriter w = new LastraWriter(outputStream)) {
 }
 ```
 
+### Write with row groups (for range queries)
+
+```java
+try (LastraWriter w = new LastraWriter(outputStream)) {
+    w.setRowGroupSize(3600);  // 1 hour of 1s ticks per row group
+    w.addSeriesColumn("ts", DataType.LONG, Codec.DELTA_VARINT);
+    w.addSeriesColumn("close", DataType.DOUBLE, Codec.ALP);
+    // writeSeries auto-partitions into row groups
+    w.writeSeries(86400, dayTimestamps, dayCloses);  // 24 RGs for a full day
+}
+```
+
 ### Read (selective columns)
 
 ```java
@@ -141,6 +168,25 @@ Map<String, String> meta = r.getSeriesColumn("ema1").metadata();
 // Events (independent timestamps)
 long[] signalTs = r.readEventLong("ts");
 byte[][] signalData = r.readEventBinary("data");
+```
+
+### Read with temporal filtering (row groups)
+
+```java
+LastraReader r = LastraReader.from(inputStream);
+
+// Skip row groups outside the query window
+long queryFrom = Instant.parse("2026-04-07T14:00:00Z").toEpochMilli();
+long queryTo   = Instant.parse("2026-04-07T16:00:00Z").toEpochMilli();
+
+for (int i = 0; i < r.rowGroupCount(); i++) {
+    RowGroupStats stats = r.rowGroupStats(i);
+    if (stats.tsMax() < queryFrom || stats.tsMin() > queryTo) continue;
+
+    // Only decode row groups that overlap the query range
+    long[] ts = r.readRowGroupLong(i, "ts");
+    double[] close = r.readRowGroupDouble(i, "close");
+}
 ```
 
 ## Compression Ratios
