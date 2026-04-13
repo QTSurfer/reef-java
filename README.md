@@ -272,6 +272,41 @@ Lastra applies **semantic compression** that understands the data:
 
 [Apache ORC](https://orc.apache.org/) has ACID transaction support (Hive), bloom filters for equality predicates, excellent integer encoding (RLE v2), a mature ecosystem (Hive, Spark, Presto/Trino, Flink, Iceberg), and support for complex nested types via Protobuf schemas.
 
+## Lastra vs ClickHouse Native Format
+
+ClickHouse is the closest comparison because it also supports **per-column codec selection** for doubles — unlike Parquet and ORC which use PLAIN encoding.
+
+### Codec comparison
+
+| Aspect | [ClickHouse](https://clickhouse.com/) native | Lastra |
+|--------|---|---|
+| **Timestamps** | DoubleDelta + LZ4 (~1-2 bytes/value) | DELTA_VARINT (~1 byte/value) |
+| **Doubles (numeric)** | **Gorilla** (XOR), **FPC** (predictor-based) + ZSTD | **ALP** (~3-4 bits/value), **Pongo** (~18 bits/value), **Gorilla** (XOR) |
+| **Per-column codec** | Yes (`CODEC(Gorilla, ZSTD)` per column in DDL) | Yes (per column in file header) |
+| **Block compression** | LZ4, LZ4HC, ZSTD (layered on top of codecs) | No (compression integrated per codec) |
+| **Codec pipeline** | Codec first → block compression second | Single-pass per codec |
+| **Row groups** | Granules (8192 rows default, configurable) | Configurable (default 4096 rows) |
+| **ALP support** | Not yet ([under discussion](https://github.com/ClickHouse/ClickHouse/discussions/60393)) | **Yes** (via [alp-java](https://github.com/QTSurfer/alp-java)) |
+| **Format type** | Database engine storage (`.bin` + `.mrk2` + `primary.idx`) | Standalone file (`.lastra`) |
+| **Dependencies** | Full ClickHouse server | alp-java + zstd-jni |
+| **Use case** | OLAP database with SQL queries | Portable file format for archival and exchange |
+
+### The double compression gap
+
+ClickHouse offers **Gorilla** and **FPC** for Float64 columns — both are XOR/predictor-based codecs that work well for volatile metrics but don't understand decimal structure.
+
+For financial prices like `65007.28`:
+- **ClickHouse Gorilla**: XOR between consecutive values → ~32-40 bits/value (depends on volatility)
+- **ClickHouse FPC**: Predictor + XOR → similar range, faster decompression
+- **Lastra ALP**: Decimal-aware → `65007.28` × 100 = `6500728` → integer encoding → **3-4 bits/value**
+- **Lastra Pongo**: Decimal erasure + XOR → **~18 bits/value**
+
+ALP is [published research](https://dl.acm.org/doi/10.1145/3626717) (ACM SIGMOD 2024) showing **50% better compression and 44x faster scans** than Gorilla. ClickHouse has it as an open feature request but hasn't integrated it yet.
+
+### Where ClickHouse wins
+
+ClickHouse is a full OLAP database — SQL queries, distributed joins, materialized views, real-time ingestion, replication, and a massive ecosystem. Lastra is a file format. If you need a query engine, use ClickHouse (and potentially store exports as `.lastra` files for archival or cross-system exchange).
+
 ## Dependency (JitPack)
 
 ### Maven
