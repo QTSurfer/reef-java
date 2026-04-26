@@ -95,26 +95,52 @@ public class LastraReader {
         this.rgColLen = new ArrayList<>();
         this.rgColCrcs = new ArrayList<>();
 
-        // Detect footer size hint: last 8 bytes = [LAS! magic][footer size LE]
-        // If present, we know exactly where the footer starts.
-        int trailerSize = 8; // LAS! + footerSize
+        // Trailer detection. Two layouts coexist in the wild:
+        //   * pre-size-hint (lastra-java tag 0.8.0 and lastra-convert ≤ 0.12.0):
+        //     last 4 bytes are FOOTER_MAGIC and that's it
+        //   * with size hint (current writer): last 8 bytes are
+        //     [FOOTER_MAGIC][footerSize LE], so HTTP-Range clients can grab
+        //     the footer in a second request.
+        // We try the modern layout first, then fall back to the legacy one.
+        int trailerSize;
         boolean hasFooterSizeHint = false;
-        if (data.length >= 8) {
-            int trailMagic = getIntLE(data, data.length - 8);
-            if (trailMagic == Lastra.FOOTER_MAGIC) {
-                hasFooterSizeHint = true;
-                trailerSize = 8;
-            }
+        if (data.length >= 8 && getIntLE(data, data.length - 8) == Lastra.FOOTER_MAGIC) {
+            hasFooterSizeHint = true;
+            trailerSize = 8;
+        } else if (data.length >= 4 && getIntLE(data, data.length - 4) == Lastra.FOOTER_MAGIC) {
+            trailerSize = 4;
+        } else {
+            // No magic at either position. Default to 8 so existing offsets stay
+            // consistent; column reads will fail with a clearer CRC error if the
+            // file is genuinely corrupt.
+            trailerSize = 8;
         }
 
         if (hasFooter && hasRowGroups) {
-            // Use footer size hint to locate footer precisely
-            int footerSize = getIntLE(data, data.length - 4);
-            int footerPos = data.length - trailerSize - footerSize;
+            // Two paths to locate the footer depending on whether the writer
+            // emitted a size hint:
+            //   * With hint:  footerPos = length - 8 - footerSize (cheap, exact)
+            //   * Without:    forward-scan data section group-by-group; the
+            //                 first byte that isn't a column-length prefix is
+            //                 the start of the footer. Used by lastra-java
+            //                 ≤ 0.8.0 / lastra-convert files in production.
+            int eventCols = eventColumns.size();
+            int footerPos;
+            int rgCount;
+
+            if (hasFooterSizeHint) {
+                int footerSize = getIntLE(data, data.length - 4);
+                footerPos = data.length - trailerSize - footerSize;
+                rgCount = getIntLE(data, footerPos);
+            } else {
+                int[] scanResult = scanRowGroupsForFooter(data, dataOffset, seriesColCount,
+                        eventCols, hasChecksums, trailerSize);
+                footerPos = scanResult[0];
+                rgCount = scanResult[1];
+            }
 
             // Parse footer: [rgCount][rg stats...][rg CRCs...][event offsets][event CRCs]
-            int fp = footerPos;
-            int rgCount = getIntLE(data, fp); fp += 4;
+            int fp = footerPos + 4; // skip rgCount we already read
 
             for (int i = 0; i < rgCount; i++) {
                 int rgOffset = getIntLE(data, fp); fp += 4;
@@ -134,7 +160,6 @@ public class LastraReader {
                 }
             }
 
-            int eventCols = eventColumns.size();
             this.eventOffsets = new int[eventCols];
             this.eventCrcs = new int[eventCols];
             for (int i = 0; i < eventCols; i++) { eventOffsets[i] = getIntLE(data, fp); fp += 4; }
@@ -509,6 +534,92 @@ public class LastraReader {
 
     private static ColumnDescriptor findColumn(List<ColumnDescriptor> columns, String name) {
         return columns.get(findColumnIndex(columns, name));
+    }
+
+    /**
+     * Locate the row-groups footer in a file that was written without the
+     * footer-size-hint trailer (lastra-java ≤ 0.8.0 / lastra-convert ≤ 0.12.0).
+     *
+     * <p>Strategy: walk groups of {@code seriesColCount} length-prefixed
+     * columns forward. After every candidate RG boundary, hypothesise that
+     * we're just past the data section and check whether the remaining bytes
+     * (events + footer) add up to the expected size for the current
+     * {@code rgCount}. Footer size is fully determined by
+     * {@code rgCount, seriesColCount, eventColCount, hasChecksums}; events
+     * are length-prefixed so their total size is also discoverable. The
+     * first match is the answer.
+     *
+     * @return {@code [footerPos, rgCount]}
+     */
+    private static int[] scanRowGroupsForFooter(byte[] data, int dataOffset,
+                                                 int seriesColCount, int eventColCount,
+                                                 boolean hasChecksums, int trailerSize) {
+        int trailerEnd = data.length - trailerSize;
+        int scan = dataOffset;
+        int rgCount = 0;
+
+        while (true) {
+            // Hypothesis: we have just finished `rgCount` row groups. Try to
+            // consume `eventColCount` length-prefixed event columns; if their
+            // bytes plus the implied footer size land exactly on trailerEnd,
+            // this is the boundary.
+            int eventEnd = scan;
+            boolean eventsValid = (eventColCount == 0);
+            if (eventColCount > 0) {
+                eventsValid = true;
+                for (int e = 0; e < eventColCount && eventsValid; e++) {
+                    if (eventEnd + 4 > trailerEnd) { eventsValid = false; break; }
+                    int len = getIntLE(data, eventEnd);
+                    if (len < 0 || eventEnd + 4 + len > trailerEnd) {
+                        eventsValid = false; break;
+                    }
+                    eventEnd += 4 + len;
+                }
+            }
+            if (eventsValid && rgCount > 0) {
+                int remaining = trailerEnd - eventEnd;
+                int expectedFooter = footerSizeFor(rgCount, seriesColCount,
+                        eventColCount, hasChecksums);
+                if (remaining == expectedFooter) {
+                    return new int[]{eventEnd, rgCount};
+                }
+            }
+
+            if (scan >= trailerEnd) {
+                throw new IllegalArgumentException(
+                        "Could not locate row-groups footer: scan ran off the data section");
+            }
+            // Otherwise, try to consume another row group.
+            int next = scan;
+            for (int c = 0; c < seriesColCount; c++) {
+                if (next + 4 > trailerEnd) {
+                    throw new IllegalArgumentException(
+                            "Truncated row-group data while scanning for footer");
+                }
+                int len = getIntLE(data, next);
+                if (len < 0 || next + 4 + len > trailerEnd) {
+                    throw new IllegalArgumentException(
+                            "Invalid column length while scanning for footer at byte "
+                                    + next + " (rgCount=" + rgCount + ")");
+                }
+                next += 4 + len;
+            }
+            scan = next;
+            rgCount++;
+            if (rgCount > 1_000_000) {
+                throw new IllegalArgumentException("Row-group scan exceeded 1M groups");
+            }
+        }
+    }
+
+    /** Total bytes occupied by the row-groups footer for the given parameters. */
+    private static int footerSizeFor(int rgCount, int seriesColCount,
+                                      int eventColCount, boolean hasChecksums) {
+        int rgStats = rgCount * 24;
+        int rgCrcs = hasChecksums ? rgCount * seriesColCount * 4 : 0;
+        int eventOffsetsBytes = eventColCount * 4;
+        int eventCrcsBytes = hasChecksums ? eventColCount * 4 : 0;
+        return 4 + rgStats + rgCrcs + eventOffsetsBytes + eventCrcsBytes;
     }
 
     private static int getIntLE(byte[] data, int pos) {

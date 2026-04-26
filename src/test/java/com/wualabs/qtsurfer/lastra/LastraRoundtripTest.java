@@ -388,6 +388,94 @@ class LastraRoundtripTest {
                 totalRows, r.rowGroupCount(), rgSize, bytes.length, matchedRgs);
     }
 
+    /**
+     * Files written by lastra-java ≤ 0.8.0 (and the lastra-convert ≤ 0.12.0
+     * runs that pulled that build through JitPack) ended with just the 4-byte
+     * FOOTER_MAGIC, no size hint. The HEAD reader's row-groups branch used to
+     * unconditionally read {@code data.length - 4} as a footerSize, which on
+     * legacy files was actually the magic — yielding a wildly negative
+     * {@code footerPos} and an ArrayIndexOutOfBoundsException at construction
+     * time. Production frate publisher hit this on 599/2368 instruments per
+     * hourly run before the fix.
+     */
+    @Test
+    void testRowGroupsWithLegacyFourByteTrailer() throws Exception {
+        int totalRows = 5000;
+        int rgSize = 2000;
+        long[] ts = new long[totalRows];
+        double[] close = new double[totalRows];
+        long baseTs = 1711152000000L;
+        for (int i = 0; i < totalRows; i++) {
+            ts[i] = baseTs + i * 1000L;
+            close[i] = 100.0 + i * 0.01;
+        }
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (LastraWriter w = new LastraWriter(baos)) {
+            w.setRowGroupSize(rgSize);
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("close", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.writeSeries(totalRows, ts, close);
+        }
+        byte[] modern = baos.toByteArray();
+        // Verify the modern writer emits the 8-byte trailer.
+        assertThat(modern.length).isGreaterThan(8);
+
+        // Strip the 4-byte size hint to simulate a legacy file. The trailer
+        // becomes just the FOOTER_MAGIC.
+        byte[] legacy = new byte[modern.length - 4];
+        System.arraycopy(modern, 0, legacy, 0, modern.length - 4);
+        // Sanity: last 4 bytes are the magic.
+        assertThat((legacy[legacy.length - 4] & 0xFF)
+                | ((legacy[legacy.length - 3] & 0xFF) << 8)
+                | ((legacy[legacy.length - 2] & 0xFF) << 16)
+                | ((legacy[legacy.length - 1] & 0xFF) << 24))
+                .isEqualTo(Lastra.FOOTER_MAGIC);
+
+        LastraReader r = LastraReader.from(legacy);
+        assertThat(r.seriesRowCount()).isEqualTo(totalRows);
+        assertThat(r.rowGroupCount()).isEqualTo(3); // 5000 / 2000 = 2 + 1
+        assertThat(r.readSeriesLong("ts")).containsExactly(ts);
+        assertBitExact(r.readSeriesDouble("close"), close);
+    }
+
+    /**
+     * Regression for the bug that produced doubled lastra files in production:
+     * lastra-convert ≤ 0.12.0 called {@code w.close()} explicitly inside a
+     * try-with-resources block, so close() ran twice and emitted the body
+     * twice. Files written this way grew to 2× their expected size and broke
+     * any reader that walked them as a single Lastra blob.
+     */
+    @Test
+    void testCloseIsIdempotent() throws Exception {
+        long[] ts = {1, 2, 3};
+        double[] v = {1.0, 2.0, 3.0};
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (LastraWriter w = new LastraWriter(baos)) {
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("v", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.writeSeries(3, ts, v);
+            w.close();
+            // Try-with-resources will call close() again on exit. Both calls
+            // together must produce a single, well-formed file.
+        }
+        byte[] singleClose = baos.toByteArray();
+
+        ByteArrayOutputStream baos2 = new ByteArrayOutputStream();
+        try (LastraWriter w = new LastraWriter(baos2)) {
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("v", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.writeSeries(3, ts, v);
+            // No explicit close — let try-with-resources do it.
+        }
+        byte[] autoClose = baos2.toByteArray();
+
+        assertThat(singleClose).isEqualTo(autoClose);
+        LastraReader r = LastraReader.from(singleClose);
+        assertThat(r.seriesRowCount()).isEqualTo(3);
+        assertThat(r.readSeriesLong("ts")).containsExactly(ts);
+    }
+
     private static void assertBitExact(double[] actual, double[] expected) {
         assertThat(actual).hasSize(expected.length);
         for (int i = 0; i < expected.length; i++) {

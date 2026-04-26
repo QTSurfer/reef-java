@@ -57,6 +57,7 @@ public class LastraWriter implements Closeable {
     private int seriesRowCount;
     private int eventsRowCount;
     private int rowGroupSize = DEFAULT_ROW_GROUP_SIZE;
+    private boolean closed;
 
     /** Default row group size in rows. */
     public static final int DEFAULT_ROW_GROUP_SIZE = 4096;
@@ -237,6 +238,13 @@ public class LastraWriter implements Closeable {
 
     @Override
     public void close() throws IOException {
+        // Idempotent. Production caller pattern (lastra-convert ≤ 0.12.0)
+        // accidentally invoked close() explicitly inside a try-with-resources,
+        // which silently doubled the file contents for every backfill output.
+        // Multiple invocations now no-op after the first.
+        if (closed) return;
+        closed = true;
+
         boolean hasEvents = !eventColumns.isEmpty() && eventsRowCount > 0;
         boolean hasRowGroups = rowGroups.size() > 1;
         int flags = Lastra.FLAG_HAS_FOOTER | Lastra.FLAG_HAS_CHECKSUMS;
