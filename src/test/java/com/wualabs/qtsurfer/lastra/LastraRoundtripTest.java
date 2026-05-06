@@ -476,6 +476,74 @@ class LastraRoundtripTest {
         assertThat(r.readSeriesLong("ts")).containsExactly(ts);
     }
 
+    /**
+     * Streaming-append usage: caller invokes {@link LastraWriter#writeSeries} multiple times,
+     * each call carrying the next chunk of the series. The single-call variant is already
+     * covered by {@link #testRowGroupsAutoPartitioning} (one writeSeries → auto-partitioned
+     * into N RGs by rgSize). This case is the dual: K calls, each {@code writeSeries(rgSize)}
+     * produces one RG, and the reader sees K RGs whose concatenated content equals the union.
+     *
+     * <p>Verifies on the writer side: {@link LastraReader#seriesRowCount} reports the SUM of
+     * rows across calls (not just the last call), {@link LastraReader#rowGroupCount} reports K,
+     * each RG's stats are bound to its slice, and {@link LastraReader#readSeriesLong} /
+     * {@code readSeriesDouble} return all K*rgSize values in chronological order.
+     */
+    @Test
+    void testMultipleWriteSeriesCallsAccumulate() throws Exception {
+        int rgSize = 100;
+        int rgCount = 4;
+        long t0 = 1_700_000_000_000L;
+        long hourMs = 3_600_000L;
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (LastraWriter w = new LastraWriter(baos)) {
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("v", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.setRowGroupSize(rgSize);
+            for (int g = 0; g < rgCount; g++) {
+                long[] ts = new long[rgSize];
+                double[] v = new double[rgSize];
+                for (int i = 0; i < rgSize; i++) {
+                    ts[i] = t0 + g * hourMs + i;
+                    v[i] = 100.0 + g + i * 0.01;
+                }
+                w.writeSeries(rgSize, ts, v);
+            }
+        }
+
+        LastraReader r = LastraReader.from(baos.toByteArray());
+        int totalRows = rgCount * rgSize;
+
+        assertThat(r.rowGroupCount()).as("rgCount").isEqualTo(rgCount);
+        assertThat(r.seriesRowCount())
+                .as("seriesRowCount must be the sum across writeSeries() calls")
+                .isEqualTo(totalRows);
+
+        // Per-RG stats: each call produces one RG with its own time bounds.
+        for (int g = 0; g < rgCount; g++) {
+            RowGroupStats s = r.rowGroupStats(g);
+            assertThat(s.rowCount()).as("rg %d rowCount", g).isEqualTo(rgSize);
+            assertThat(s.tsMin()).as("rg %d tsMin", g).isEqualTo(t0 + g * hourMs);
+            assertThat(s.tsMax()).as("rg %d tsMax", g).isEqualTo(t0 + g * hourMs + (rgSize - 1));
+        }
+
+        // Whole-series read returns all rows from all RGs in order.
+        long[] ts = r.readSeriesLong("ts");
+        double[] v = r.readSeriesDouble("v");
+        assertThat(ts).hasSize(totalRows);
+        assertThat(v).hasSize(totalRows);
+        assertThat(ts[0]).isEqualTo(t0);
+        assertThat(ts[rgSize]).as("first ts of RG #2").isEqualTo(t0 + hourMs);
+        assertThat(ts[totalRows - 1]).isEqualTo(t0 + (rgCount - 1) * hourMs + (rgSize - 1));
+        assertThat(v[0]).isEqualTo(100.0);
+        assertThat(v[totalRows - 1]).isEqualTo(100.0 + (rgCount - 1) + (rgSize - 1) * 0.01);
+
+        // Per-RG read returns exactly that RG's slice.
+        long[] rg2Ts = r.readRowGroupLong(2, "ts");
+        assertThat(rg2Ts).hasSize(rgSize);
+        assertThat(rg2Ts[0]).isEqualTo(t0 + 2 * hourMs);
+    }
+
     private static void assertBitExact(double[] actual, double[] expected) {
         assertThat(actual).hasSize(expected.length);
         for (int i = 0; i < expected.length; i++) {

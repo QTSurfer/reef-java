@@ -115,7 +115,9 @@ public class LastraWriter implements Closeable {
      * {@code double[]} for DOUBLE, {@code byte[][]} for BINARY.
      */
     public LastraWriter writeSeries(int rowCount, Object... columnData) {
-        this.seriesRowCount = rowCount;
+        // Accumulate across calls — each invocation appends rows to the same series rather
+        // than replacing it. The footer's series row count must reflect the total written.
+        this.seriesRowCount += rowCount;
 
         // Partition into row groups
         for (int start = 0; start < rowCount; start += rowGroupSize) {
