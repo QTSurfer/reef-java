@@ -21,6 +21,7 @@ public class LastraTestFixtureGenerator {
         generateWithMetadata(outDir);
         generateWithEvents(outDir);
         generateWithRowGroups(outDir);
+        generateMultipleWriteSeriesCalls(outDir);
 
         System.out.println("Fixtures written to " + outDir);
     }
@@ -104,6 +105,31 @@ public class LastraTestFixtureGenerator {
             w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
             w.addSeriesColumn("close", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
             w.writeSeries(totalRows, ts, close);
+        }
+    }
+
+    // Streaming-append: K calls of writeSeries(rgSize, ...). Dual of the single-call,
+    // auto-partitioned row-groups.lastra fixture. Validates that the footer's
+    // seriesRowCount equals the SUM across calls (regression for 0.8.2 writer fix).
+    private static void generateMultipleWriteSeriesCalls(Path dir) throws Exception {
+        int rgSize = 100;
+        int rgCount = 4;
+        long t0 = 1_700_000_000_000L;
+        long hourMs = 3_600_000L;
+
+        try (LastraWriter w = new LastraWriter(new FileOutputStream(dir.resolve("multi-write.lastra").toFile()))) {
+            w.setRowGroupSize(rgSize);
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("v", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            for (int g = 0; g < rgCount; g++) {
+                long[] ts = new long[rgSize];
+                double[] v = new double[rgSize];
+                for (int i = 0; i < rgSize; i++) {
+                    ts[i] = t0 + g * hourMs + i;
+                    v[i] = 100.0 + g + i * 0.01;
+                }
+                w.writeSeries(rgSize, ts, v);
+            }
         }
     }
 }
