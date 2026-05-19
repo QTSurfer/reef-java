@@ -6,6 +6,7 @@ import com.wualabs.qtsurfer.lastra.codec.GorillaCodec;
 import com.wualabs.qtsurfer.lastra.codec.PongoCodec;
 import com.wualabs.qtsurfer.lastra.codec.RawCodec;
 import com.wualabs.qtsurfer.lastra.codec.VarlenCodec;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
@@ -43,10 +44,9 @@ public class LastraWriter implements Closeable {
     private final List<ColumnDescriptor> seriesColumns = new ArrayList<>();
     private final List<ColumnDescriptor> eventColumns = new ArrayList<>();
 
-    // Buffered column data (accumulated during write phase)
-    private final List<long[]> seriesLongBuffers = new ArrayList<>();
-    private final List<double[]> seriesDoubleBuffers = new ArrayList<>();
-    private final List<byte[][]> seriesBinaryBuffers = new ArrayList<>();
+    // Events still buffer their raw column data (close() reads from these for events output).
+    // Series went to row-group-only retention in 0.8.3 — see writeSeries() for the removed
+    // dead block.
     private final List<long[]> eventLongBuffers = new ArrayList<>();
     private final List<double[]> eventDoubleBuffers = new ArrayList<>();
     private final List<byte[][]> eventBinaryBuffers = new ArrayList<>();
@@ -167,27 +167,12 @@ public class LastraWriter implements Closeable {
             rowGroups.add(new RowGroupData(rgRows, tsMin, tsMax, compressed, crcs));
         }
 
-        // Also store raw buffers for single-RG backward compat path (not used when rowGroups > 0)
-        for (int i = 0; i < seriesColumns.size(); i++) {
-            ColumnDescriptor col = seriesColumns.get(i);
-            switch (col.dataType()) {
-                case LONG:
-                    seriesLongBuffers.add((long[]) columnData[i]);
-                    seriesDoubleBuffers.add(null);
-                    seriesBinaryBuffers.add(null);
-                    break;
-                case DOUBLE:
-                    seriesLongBuffers.add(null);
-                    seriesDoubleBuffers.add((double[]) columnData[i]);
-                    seriesBinaryBuffers.add(null);
-                    break;
-                case BINARY:
-                    seriesLongBuffers.add(null);
-                    seriesDoubleBuffers.add(null);
-                    seriesBinaryBuffers.add((byte[][]) columnData[i]);
-                    break;
-            }
-        }
+        // 0.8.3 (#93b streaming): the series{Long,Double,Binary}Buffers retention block
+        // that lived here was dead — close() never reads from them for series output (it
+        // serialises from `rowGroups`). The block held one Object reference per writeSeries()
+        // call × N columns, which for streaming callers (lastra-convert >= 0.14 with one
+        // writeSeries per parquet row-group) doubled heap residency for nothing. Removed.
+        // Events path still uses event*Buffers and is untouched.
         return this;
     }
 
@@ -253,7 +238,13 @@ public class LastraWriter implements Closeable {
         if (hasEvents) flags |= Lastra.FLAG_HAS_EVENTS;
         if (hasRowGroups) flags |= Lastra.FLAG_HAS_ROW_GROUPS;
 
-        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        // 0.8.3 (#93b streaming): write directly to `out` (wrapped) instead of accumulating
+        // the whole body in a ByteArrayOutputStream first. The old path OOMed on lastra-convert
+        // 0.14 streaming inputs because BAOS would buffer 2832+ row-groups worth of compressed
+        // column bytes + grow-doubling amplification before the single flush at the end.
+        // CountingOutputStream gives us absolute byte offsets without needing to seek back.
+        BufferedOutputStream buffered = new BufferedOutputStream(out, 64 * 1024);
+        CountingOutputStream body = new CountingOutputStream(buffered);
 
         // === HEADER ===
         ByteBuffer header = ByteBuffer.allocate(22).order(ByteOrder.LITTLE_ENDIAN);
@@ -272,14 +263,16 @@ public class LastraWriter implements Closeable {
             writeColumnDescriptors(body, eventColumns);
         }
 
-        int dataStart = body.size();
+        long dataStart = body.position;
 
         // === SERIES DATA (row groups) ===
-        List<Integer> rgOffsets = new ArrayList<>();
+        // Gather offsets as we write — keep them in memory until footer time (1 int per RG).
+        int[] rgOffsets = new int[rowGroups.size()];
         if (hasRowGroups) {
             // Multiple row groups: write each RG's columns sequentially
-            for (RowGroupData rg : rowGroups) {
-                rgOffsets.add(body.size() - dataStart);
+            for (int i = 0; i < rowGroups.size(); i++) {
+                RowGroupData rg = rowGroups.get(i);
+                rgOffsets[i] = (int) (body.position - dataStart);
                 for (byte[] colData : rg.compressedColumns) {
                     writeIntLE(body, colData.length);
                     body.write(colData);
@@ -301,7 +294,7 @@ public class LastraWriter implements Closeable {
             List<byte[]> eventsCompressed = compressColumns(eventColumns,
                     eventLongBuffers, eventDoubleBuffers, eventBinaryBuffers, eventsRowCount);
             for (byte[] colData : eventsCompressed) {
-                eventOffsets.add(body.size() - dataStart);
+                eventOffsets.add((int) (body.position - dataStart));
                 writeIntLE(body, colData.length);
                 body.write(colData);
                 eventCrcs.add(crc32(colData));
@@ -309,13 +302,13 @@ public class LastraWriter implements Closeable {
         }
 
         // === FOOTER ===
-        int footerStart = body.size();
+        long footerStart = body.position;
         if (hasRowGroups) {
             // Row group metadata
             writeIntLE(body, rowGroups.size());
             for (int i = 0; i < rowGroups.size(); i++) {
                 RowGroupData rg = rowGroups.get(i);
-                writeIntLE(body, rgOffsets.get(i));   // byte offset
+                writeIntLE(body, rgOffsets[i]);      // byte offset
                 writeIntLE(body, rg.rowCount);      // rows in this RG
                 writeLongLE(body, rg.tsMin);         // min timestamp
                 writeLongLE(body, rg.tsMax);         // max timestamp
@@ -342,17 +335,17 @@ public class LastraWriter implements Closeable {
             for (int crc : eventCrcs) writeIntLE(body, crc);
         }
 
-        int footerSize = body.size() - footerStart;
+        int footerSize = (int) (body.position - footerStart);
         writeIntLE(body, Lastra.FOOTER_MAGIC);
         // Footer size hint: allows HTTP Range clients to fetch footer in 2 requests
         // (read last 8 bytes → LAS! + footerSize → read footerSize bytes)
         writeIntLE(body, footerSize);
 
-        out.write(body.toByteArray());
+        buffered.flush();
         out.flush();
     }
 
-    private void writeColumnDescriptors(ByteArrayOutputStream out, List<ColumnDescriptor> columns)
+    private void writeColumnDescriptors(OutputStream out, List<ColumnDescriptor> columns)
             throws IOException {
         for (ColumnDescriptor col : columns) {
             out.write(col.codec().id);
@@ -425,21 +418,32 @@ public class LastraWriter implements Closeable {
         return (int) crc.getValue();
     }
 
-    private static void writeLongLE(ByteArrayOutputStream out, long value) {
+    private static void writeLongLE(OutputStream out, long value) throws IOException {
         writeIntLE(out, (int) value);
         writeIntLE(out, (int) (value >>> 32));
     }
 
-    private static void writeIntLE(ByteArrayOutputStream out, int value) {
+    private static void writeIntLE(OutputStream out, int value) throws IOException {
         out.write(value & 0xFF);
         out.write((value >>> 8) & 0xFF);
         out.write((value >>> 16) & 0xFF);
         out.write((value >>> 24) & 0xFF);
     }
 
-    private static void writeShortLE(ByteArrayOutputStream out, int value) {
+    private static void writeShortLE(OutputStream out, int value) throws IOException {
         out.write(value & 0xFF);
         out.write((value >>> 8) & 0xFF);
+    }
+
+    /** Counter wrapper used by streaming close() to track absolute byte offsets without
+     * accumulating the body in heap (#93b: lastra-convert 0.14 streams 2832+ row-groups). */
+    private static final class CountingOutputStream extends java.io.FilterOutputStream {
+        long position;
+        CountingOutputStream(OutputStream out) { super(out); }
+        @Override public void write(int b) throws IOException { out.write(b); position++; }
+        @Override public void write(byte[] b, int off, int len) throws IOException {
+            out.write(b, off, len); position += len;
+        }
     }
 
     private static String mapToJson(Map<String, String> map) {
