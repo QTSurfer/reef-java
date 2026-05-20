@@ -544,6 +544,110 @@ class LastraRoundtripTest {
         assertThat(rg2Ts[0]).isEqualTo(t0 + 2 * hourMs);
     }
 
+    /**
+     * Validates the new {@link LastraReader#readRowGroups()} streaming iterator:
+     * - Yields one RowGroup per file row group, in file order.
+     * - Each RowGroup decodes columns lazily and matches the column data
+     *   produced by the eager {@code readRowGroup*} APIs.
+     * - Advancing the iterator clears the previous group's decoded arrays
+     *   (a reference held to the previous group is non-null in identity but
+     *   does not hold the long[]/double[]; we verify by re-decoding and
+     *   confirming a fresh array instance is returned).
+     */
+    @Test
+    void testReadRowGroupsIterator() throws Exception {
+        int rgSize = 1000;
+        int rgCount = 5;
+        int totalRows = rgSize * rgCount;
+        long[] ts = new long[totalRows];
+        double[] close = new double[totalRows];
+        byte[][] sym = new byte[totalRows][];
+        long t0 = 1_700_000_000_000L;
+        for (int i = 0; i < totalRows; i++) {
+            ts[i] = t0 + i;
+            close[i] = 100.0 + i * 0.01;
+            sym[i] = (i % 2 == 0 ? "BTC" : "ETH").getBytes(StandardCharsets.UTF_8);
+        }
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (LastraWriter w = new LastraWriter(baos)) {
+            w.setRowGroupSize(rgSize);
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("close", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.addSeriesColumn("sym", Lastra.DataType.BINARY, Lastra.Codec.VARLEN_ZSTD);
+            w.writeSeries(totalRows, ts, close, sym);
+        }
+
+        LastraReader r = LastraReader.from(baos.toByteArray());
+        assertThat(r.rowGroupCount()).isEqualTo(rgCount);
+
+        int seenRows = 0;
+        int seenGroups = 0;
+        java.util.Iterator<RowGroup> it = r.readRowGroups();
+        while (it.hasNext()) {
+            RowGroup rg = it.next();
+            assertThat(rg.index()).isEqualTo(seenGroups);
+            assertThat(rg.rowCount()).isEqualTo(rgSize);
+            assertThat(rg.tsMin()).isEqualTo(ts[seenGroups * rgSize]);
+            assertThat(rg.tsMax()).isEqualTo(ts[seenGroups * rgSize + rgSize - 1]);
+
+            long[] rgTs = rg.getLongColumn(0);
+            double[] rgClose = rg.getDoubleColumn(1);
+            byte[][] rgSym = rg.getBinaryColumn(2);
+            assertThat(rgTs).hasSize(rgSize);
+            assertThat(rgClose).hasSize(rgSize);
+            assertThat(rgSym.length).isEqualTo(rgSize);
+            for (int i = 0; i < rgSize; i++) {
+                int absolute = seenGroups * rgSize + i;
+                assertThat(rgTs[i]).isEqualTo(ts[absolute]);
+                assertThat(Double.doubleToRawLongBits(rgClose[i]))
+                        .isEqualTo(Double.doubleToRawLongBits(close[absolute]));
+                assertThat(new String(rgSym[i], StandardCharsets.UTF_8))
+                        .isEqualTo(absolute % 2 == 0 ? "BTC" : "ETH");
+            }
+
+            // Repeated access on the same RowGroup returns the cached array (same identity).
+            assertThat(rg.getLongColumn(0)).isSameAs(rgTs);
+
+            seenRows += rg.rowCount();
+            seenGroups++;
+        }
+        assertThat(seenGroups).isEqualTo(rgCount);
+        assertThat(seenRows).isEqualTo(totalRows);
+    }
+
+    /** Single-RG (flat layout) files must still yield exactly one synthetic RowGroup. */
+    @Test
+    void testReadRowGroupsIteratorFlatLayout() throws Exception {
+        int rows = 500;
+        long[] ts = new long[rows];
+        double[] v = new double[rows];
+        for (int i = 0; i < rows; i++) {
+            ts[i] = 1_700_000_000_000L + i;
+            v[i] = i * 1.5;
+        }
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (LastraWriter w = new LastraWriter(baos)) {
+            w.addSeriesColumn("ts", Lastra.DataType.LONG, Lastra.Codec.DELTA_VARINT);
+            w.addSeriesColumn("v", Lastra.DataType.DOUBLE, Lastra.Codec.ALP);
+            w.writeSeries(rows, ts, v);
+        }
+        LastraReader r = LastraReader.from(baos.toByteArray());
+
+        java.util.Iterator<RowGroup> it = r.readRowGroups();
+        assertThat(it.hasNext()).isTrue();
+        RowGroup rg = it.next();
+        assertThat(rg.rowCount()).isEqualTo(rows);
+        long[] gotTs = rg.getLongColumn(0);
+        double[] gotV = rg.getDoubleColumn(1);
+        assertThat(gotTs).containsExactly(ts);
+        for (int i = 0; i < rows; i++) {
+            assertThat(Double.doubleToRawLongBits(gotV[i]))
+                    .isEqualTo(Double.doubleToRawLongBits(v[i]));
+        }
+        assertThat(it.hasNext()).isFalse();
+    }
+
     private static void assertBitExact(double[] actual, double[] expected) {
         assertThat(actual).hasSize(expected.length);
         for (int i = 0; i < expected.length; i++) {

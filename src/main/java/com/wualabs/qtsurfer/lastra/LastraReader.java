@@ -13,9 +13,11 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.zip.CRC32;
 
 /**
@@ -369,6 +371,112 @@ public class LastraReader {
         int colIdx = findColumnIndex(seriesColumns, name);
         byte[] colData = extractRgColumn(rgIndex, colIdx, name);
         return decodeBinaryColumn(colData, rowGroupStatsList.get(rgIndex).rowCount());
+    }
+
+    // --- Streaming row-group iterator (memory-bounded converter path) ---
+
+    /**
+     * Iterate over the file's row groups one at a time. Each {@link RowGroup} decodes
+     * its columns lazily on first access; the iterator nulls out the previous group's
+     * decoded arrays when advancing, so the caller's heap residency stays bounded to
+     * a single row group's worth of decompressed data plus codec scratch buffers.
+     *
+     * <p>For files without explicit row groups (legacy flat layout), this returns
+     * a single-element iterator that emits the whole file as one synthetic row group.
+     * In that path the file's full columns are still loaded into heap on access
+     * (there is no smaller unit to stream), but the API shape stays uniform for
+     * downstream converters.
+     *
+     * <p>The returned row groups MUST NOT be retained across iterator steps — call
+     * {@link Iterator#next()} only after fully consuming the previous group.
+     *
+     * @return iterator over row groups in file order
+     */
+    public Iterator<RowGroup> readRowGroups() {
+        if (rowGroupStatsList.isEmpty()) {
+            return new SingleRowGroupIterator();
+        }
+        return new MultiRowGroupIterator();
+    }
+
+    /** Decode one column from one row group into a fresh long[]. Package-private for {@link RowGroup}. */
+    long[] decodeRowGroupLong(int rgIndex, int colIdx) {
+        if (rowGroupStatsList.isEmpty()) {
+            // Synthetic single-RG path. Reuse the existing full-file decoder.
+            String name = seriesColumns.get(colIdx).name();
+            return readSeriesLong(name);
+        }
+        String name = seriesColumns.get(colIdx).name();
+        byte[] colData = extractRgColumn(rgIndex, colIdx, name);
+        return decodeLongColumn(colData, rowGroupStatsList.get(rgIndex).rowCount(),
+                seriesColumns.get(colIdx).codec());
+    }
+
+    /** Decode one column from one row group into a fresh double[]. Package-private for {@link RowGroup}. */
+    double[] decodeRowGroupDouble(int rgIndex, int colIdx) {
+        if (rowGroupStatsList.isEmpty()) {
+            String name = seriesColumns.get(colIdx).name();
+            return readSeriesDouble(name);
+        }
+        String name = seriesColumns.get(colIdx).name();
+        byte[] colData = extractRgColumn(rgIndex, colIdx, name);
+        return decodeDoubleColumn(colData, rowGroupStatsList.get(rgIndex).rowCount(),
+                seriesColumns.get(colIdx).codec());
+    }
+
+    /** Decode one column from one row group into a fresh byte[][]. Package-private for {@link RowGroup}. */
+    byte[][] decodeRowGroupBinary(int rgIndex, int colIdx) {
+        if (rowGroupStatsList.isEmpty()) {
+            String name = seriesColumns.get(colIdx).name();
+            return readSeriesBinary(name);
+        }
+        String name = seriesColumns.get(colIdx).name();
+        byte[] colData = extractRgColumn(rgIndex, colIdx, name);
+        return decodeBinaryColumn(colData, rowGroupStatsList.get(rgIndex).rowCount());
+    }
+
+    /** Iterator for files with explicit row groups — releases each RG's decoded data on advance. */
+    private final class MultiRowGroupIterator implements Iterator<RowGroup> {
+        private int next = 0;
+        private RowGroup current;
+
+        @Override
+        public boolean hasNext() {
+            return next < rowGroupStatsList.size();
+        }
+
+        @Override
+        public RowGroup next() {
+            if (!hasNext()) throw new NoSuchElementException();
+            if (current != null) current.clear();
+            RowGroupStats stats = rowGroupStatsList.get(next);
+            current = new RowGroup(LastraReader.this, next, stats.rowCount(),
+                    stats.tsMin(), stats.tsMax(), seriesColumns.size());
+            next++;
+            return current;
+        }
+    }
+
+    /** Iterator for the flat (no row-groups) layout — emits one synthetic row group. */
+    private final class SingleRowGroupIterator implements Iterator<RowGroup> {
+        private boolean consumed = false;
+        private RowGroup current;
+
+        @Override
+        public boolean hasNext() {
+            return !consumed;
+        }
+
+        @Override
+        public RowGroup next() {
+            if (consumed) throw new NoSuchElementException();
+            consumed = true;
+            // Stats unknown without a footer-with-row-groups; pass min/max as Long.MIN/MAX
+            // so consumers that gate on them treat the whole file as overlapping any query.
+            current = new RowGroup(LastraReader.this, 0, seriesRowCount,
+                    Long.MIN_VALUE, Long.MAX_VALUE, seriesColumns.size());
+            return current;
+        }
     }
 
     private byte[] extractRgColumn(int rgIndex, int colIdx, String name) {
